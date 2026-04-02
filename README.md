@@ -34,6 +34,7 @@ AviUtl2 用の ONNX / WinML ベース AI フィルタープラグインです。
 - [OpenModelDB](https://openmodeldb.info/)
 - [hooke007](https://github.com/hooke007/dotfiles/releases/tag/onnx_models)
 - [mpv-cHiDeNoise-AI](https://github.com/animeojisan/mpv-cHiDeNoise-AI)
+- [anime4kOnnx](https://github.com/kato-megumi/anime4kOnnx)
 
 ## pth→onnx変換ツール
 
