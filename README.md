@@ -29,6 +29,16 @@ AviUtl2 用の ONNX / WinML ベース AI フィルタープラグインです。
 - 非対応モデルや読込失敗時は、フィルター効果が適用されない場合があります
 - ONNX モデルごとにライセンス条件が異なる場合があります
 
+## ONNX配布先
+
+- [OpenModelDB](https://openmodeldb.info/)
+- [hooke007](https://github.com/hooke007/dotfiles/releases/tag/onnx_models)
+- [mpv-cHiDeNoise-AI](https://github.com/animeojisan/mpv-cHiDeNoise-AI)
+
+## pth→onnx変換ツール
+
+- [sisr2onnx](https://huggingface.co/spaces/Zarxrax/sisr2onnx)
+
 ## 免責事項
 本ソフトウェアは個人制作によるものです。ご利用は各自の判断と責任でお願いいたします。
 本ソフトウェアの導入、設定、使用により生じたいかなる不具合、損害、トラブル等についても作者は責任を負いかねます。
