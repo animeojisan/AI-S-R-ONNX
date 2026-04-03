@@ -12,7 +12,7 @@ AviUtl2 用の ONNX / WinML ベース AI フィルタプラグインです。
 - 1x / 2～4x モデル対応
 - FP32 / FP16 モデル対応
 
-## 動作環境
+## :computer:動作環境
 - Windows環境
 - AviUtl2
 - ONNXモデルファイル
