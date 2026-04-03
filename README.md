@@ -12,6 +12,14 @@ AviUtl2 用の ONNX / WinML ベース AI フィルタプラグインです。
 - 1x / 2～4x モデル対応
 - FP32 / FP16 モデル対応
 
+## 動作環境
+- Windows環境
+- AviUtl2
+- ONNXモデルファイル
+- GPUまたはCPUでの推論実行環境
+
+※本プラグインは使用するモデルやPC環境により、動作速度・安定性・対応可否が異なります。
+
 ## 使い方
 
 1. `AI Super-Resolution ONNX.auf2` を AviUtl2 の `Plugin` フォルダに入れます
