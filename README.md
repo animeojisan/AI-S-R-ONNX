@@ -20,7 +20,7 @@ AviUtl2 用の ONNX / WinML ベース AI フィルタプラグインです。
 
 ※本プラグインは使用するモデルやPC環境により、動作速度・安定性・対応可否が異なります。
 
-## 使い方
+## :hammer_and_wrench:使い方
 
 1. `AI Super-Resolution ONNX.auf2` を AviUtl2 の `Plugin` フォルダに入れます
 2. AviUtl2 を起動します
