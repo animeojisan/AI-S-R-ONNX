@@ -37,7 +37,7 @@ AviUtl2 用の ONNX / WinML ベース AI フィルタプラグインです。
 - 非対応モデルや読込失敗時は、フィルター効果が適用されない場合があります
 - ONNX モデルごとにライセンス条件が異なる場合があります
 
-## ONNX配布先
+## :package:ONNX配布先
 
 - [OpenModelDB](https://openmodeldb.info/)
 - [hooke007](https://github.com/hooke007/dotfiles/releases/tag/onnx_models)
