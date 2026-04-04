@@ -1,6 +1,6 @@
 # AI S-R ONNX
 
-AviUtl2 用の ONNX / WinML ベース AI フィルタプラグインです。
+AviUtl2 用の ONNX / WinML ベース AI 超解像（Super-Resolution）フィルタプラグインです。
 
 1x のデノイズ系モデルや 2～4x のアップスケーリングモデルを読み込み、AviUtl2 上で適用できます。
 
