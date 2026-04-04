@@ -1,4 +1,4 @@
-# AI Super-Resolution ONNX
+# AI S-R ONNX
 
 AviUtl2 用の ONNX / WinML ベース AI フィルタプラグインです。
 
@@ -22,9 +22,9 @@ AviUtl2 用の ONNX / WinML ベース AI フィルタプラグインです。
 
 ## :hammer_and_wrench:使い方
 
-1. `AI Super-Resolution ONNX.auf2` を AviUtl2 の `Plugin` フォルダに入れます
+1. `AI S-R ONNX.auf2` を AviUtl2 の `Plugin` フォルダに入れます
 2. AviUtl2 を起動します
-3. 動画または画像オブジェクトに **AI Super-Resolution ONNX** を追加します
+3. 動画または画像オブジェクトに **AI S-R ONNX** を追加します
 4. `ONNXファイル` から使用する `.onnx` を選択します
 
 ## 注意事項
