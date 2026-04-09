@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -18,6 +19,9 @@
 #include <thread>
 #include <condition_variable>
 #include <functional>
+#include <fstream>
+#include <sstream>
+#include <chrono>
 #include <robuffer.h>
 
 #include <d3d11.h>
@@ -32,11 +36,13 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <winrt/Windows.Storage.Streams.h>
 
 namespace ml = winrt::Windows::AI::MachineLearning;
 namespace wfc = winrt::Windows::Foundation::Collections;
 namespace wg = winrt::Windows::Graphics;
 namespace wgdx11 = winrt::Windows::Graphics::DirectX::Direct3D11;
+namespace wss = winrt::Windows::Storage::Streams;
 using Microsoft::WRL::ComPtr;
 
 static uint16_t FloatToHalfBits(float value);
@@ -70,14 +76,41 @@ static void* g_items[] = {
     nullptr
 };
 
-// Debug logging is compiled out in release builds.
+static std::wstring GetPluginLogPath() {
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&GetPluginLogPath), &hm)) {
+        wchar_t module_path[MAX_PATH] = {};
+        if (GetModuleFileNameW(hm, module_path, MAX_PATH)) {
+            std::filesystem::path p(module_path);
+            return (p.parent_path() / L"AI_S-R_ONNX.log").wstring();
+        }
+    }
+    return L"AI_S-R_ONNX.log";
+}
+
+static void AppendLogLine(const std::wstring& text) {
+    (void)text;
+}
+
 static void DebugOut(const wchar_t* text) {
 #ifdef _DEBUG
-    OutputDebugStringW(text);
+    OutputDebugStringW(text ? text : L"");
     OutputDebugStringW(L"\n");
 #else
     (void)text;
 #endif
+    if (text) AppendLogLine(text);
+}
+
+static void DebugOutHotPath(const wchar_t* text) {
+#ifdef _DEBUG
+    OutputDebugStringW(text ? text : L"");
+    OutputDebugStringW(L"\n");
+#else
+    (void)text;
+#endif
+    // hot pathでは通常ログファイルへ追記しない
 }
 
 
@@ -137,6 +170,28 @@ static inline uint8_t FastClampToU8(float v) {
     if (v <= 0.0f) return 0;
     if (v >= 1.0f) return 255;
     return static_cast<uint8_t>(v * 255.0f + 0.5f);
+}
+
+static inline float Clamp01(float v) {
+    if (v <= 0.0f) return 0.0f;
+    if (v >= 1.0f) return 1.0f;
+    return v;
+}
+
+static inline float PixelLuma01(const PIXEL_RGBA& p) {
+    return (0.299f * static_cast<float>(p.r) + 0.587f * static_cast<float>(p.g) + 0.114f * static_cast<float>(p.b)) * (1.0f / 255.0f);
+}
+
+static inline float PixelCb01(const PIXEL_RGBA& p) {
+    const float y = PixelLuma01(p);
+    const float b = static_cast<float>(p.b) * (1.0f / 255.0f);
+    return Clamp01((b - y) / 1.772f + 0.5f);
+}
+
+static inline float PixelCr01(const PIXEL_RGBA& p) {
+    const float y = PixelLuma01(p);
+    const float r = static_cast<float>(p.r) * (1.0f / 255.0f);
+    return Clamp01((r - y) / 1.402f + 0.5f);
 }
 
 static int ChooseMinRowsPerTask(int w, int h) {
@@ -309,6 +364,285 @@ static float HalfBitsToFloat(uint16_t value) {
     std::memcpy(&out, &bits, sizeof(out));
     return out;
 }
+static std::wstring GetPluginDirectoryPath() {
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&GetPluginDirectoryPath), &hm)) {
+        wchar_t module_path[MAX_PATH] = {};
+        if (GetModuleFileNameW(hm, module_path, MAX_PATH)) {
+            return std::filesystem::path(module_path).parent_path().wstring();
+        }
+    }
+    return std::filesystem::current_path().wstring();
+}
+
+static uint64_t HashPathAndTime(const std::wstring& path) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            h ^= static_cast<uint8_t>((v >> (i * 8)) & 0xffu);
+            h *= 1099511628211ull;
+        }
+    };
+    for (wchar_t c : path) {
+        h ^= static_cast<uint16_t>(c);
+        h *= 1099511628211ull;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        mix((static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow);
+        mix((static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) | fad.ftLastWriteTime.dwLowDateTime);
+    }
+    return h;
+}
+
+static bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out, std::wstring& error) {
+    try {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) {
+            error = L"モデルファイルを開けません";
+            return false;
+        }
+        ifs.seekg(0, std::ios::end);
+        std::streamoff size = ifs.tellg();
+        if (size < 0) {
+            error = L"モデルサイズ取得に失敗しました";
+            return false;
+        }
+        ifs.seekg(0, std::ios::beg);
+        out.resize(static_cast<size_t>(size));
+        if (!out.empty()) {
+            ifs.read(reinterpret_cast<char*>(out.data()), size);
+            if (!ifs) {
+                error = L"モデル読み込みに失敗しました";
+                out.clear();
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        error = L"モデル読み込み中に例外が発生しました";
+        out.clear();
+        return false;
+    }
+}
+
+static bool WriteFileBytes(const std::wstring& path, const std::vector<uint8_t>& data, std::wstring& error) {
+    try {
+        std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            error = L"再焼成モデルを書き込めません";
+            return false;
+        }
+        if (!data.empty()) {
+            ofs.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+            if (!ofs) {
+                error = L"再焼成モデルの書き込みに失敗しました";
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        error = L"再焼成モデル書き込み中に例外が発生しました";
+        return false;
+    }
+}
+
+static bool ReadProtoVarint(const uint8_t* data, size_t size, size_t& pos, uint64_t& value) {
+    value = 0;
+    int shift = 0;
+    while (pos < size && shift <= 63) {
+        const uint8_t b = data[pos++];
+        value |= static_cast<uint64_t>(b & 0x7fu) << shift;
+        if ((b & 0x80u) == 0) return true;
+        shift += 7;
+    }
+    return false;
+}
+
+static void AppendProtoVarint(std::vector<uint8_t>& out, uint64_t value) {
+    do {
+        uint8_t b = static_cast<uint8_t>(value & 0x7fu);
+        value >>= 7;
+        if (value) b |= 0x80u;
+        out.push_back(b);
+    } while (value);
+}
+
+static bool ExtractOpsetDomain(const uint8_t* data, size_t size, std::string& domain, uint64_t& version) {
+    domain.clear();
+    version = 0;
+    size_t pos = 0;
+    while (pos < size) {
+        uint64_t key = 0;
+        if (!ReadProtoVarint(data, size, pos, key)) return false;
+        const uint32_t field = static_cast<uint32_t>(key >> 3);
+        const uint32_t wire = static_cast<uint32_t>(key & 7u);
+        if (wire == 0) {
+            uint64_t v = 0;
+            if (!ReadProtoVarint(data, size, pos, v)) return false;
+            if (field == 2) version = v;
+        } else if (wire == 2) {
+            uint64_t len = 0;
+            if (!ReadProtoVarint(data, size, pos, len)) return false;
+            if (len > size - pos) return false;
+            if (field == 1) domain.assign(reinterpret_cast<const char*>(data + pos), static_cast<size_t>(len));
+            pos += static_cast<size_t>(len);
+        } else if (wire == 1) {
+            if (size - pos < 8) return false;
+            pos += 8;
+        } else if (wire == 5) {
+            if (size - pos < 4) return false;
+            pos += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool BuildWinMLCompatibleModelBytes(const std::wstring& model_path, std::vector<uint8_t>& out, bool& changed, std::wstring& error) {
+    std::vector<uint8_t> src;
+    if (!ReadFileBytes(model_path, src, error)) return false;
+    if (src.empty()) {
+        error = L"ONNXが空です";
+        return false;
+    }
+
+    out.clear();
+    out.reserve(src.size());
+    size_t pos = 0;
+    changed = false;
+    bool kept_default = false;
+
+    while (pos < src.size()) {
+        const size_t field_start = pos;
+        uint64_t key = 0;
+        if (!ReadProtoVarint(src.data(), src.size(), pos, key)) {
+            error = L"ONNX解析失敗: key";
+            return false;
+        }
+        const uint32_t field = static_cast<uint32_t>(key >> 3);
+        const uint32_t wire = static_cast<uint32_t>(key & 7u);
+
+        if (wire == 0) {
+            uint64_t v = 0;
+            if (!ReadProtoVarint(src.data(), src.size(), pos, v)) {
+                error = L"ONNX解析失敗: varint";
+                return false;
+            }
+            out.insert(out.end(), src.begin() + field_start, src.begin() + pos);
+            continue;
+        }
+        if (wire == 1) {
+            if (src.size() - pos < 8) {
+                error = L"ONNX解析失敗: fixed64";
+                return false;
+            }
+            pos += 8;
+            out.insert(out.end(), src.begin() + field_start, src.begin() + pos);
+            continue;
+        }
+        if (wire == 5) {
+            if (src.size() - pos < 4) {
+                error = L"ONNX解析失敗: fixed32";
+                return false;
+            }
+            pos += 4;
+            out.insert(out.end(), src.begin() + field_start, src.begin() + pos);
+            continue;
+        }
+        if (wire != 2) {
+            error = L"ONNX解析失敗: unsupported wire";
+            return false;
+        }
+
+        uint64_t len64 = 0;
+        if (!ReadProtoVarint(src.data(), src.size(), pos, len64)) {
+            error = L"ONNX解析失敗: length";
+            return false;
+        }
+        if (len64 > src.size() - pos) {
+            error = L"ONNX解析失敗: truncated field";
+            return false;
+        }
+        const size_t payload_pos = pos;
+        const size_t field_end = payload_pos + static_cast<size_t>(len64);
+        pos = field_end;
+
+        if (field == 8) {
+            std::string domain;
+            uint64_t version = 0;
+            if (!ExtractOpsetDomain(src.data() + payload_pos, static_cast<size_t>(len64), domain, version)) {
+                error = L"ONNX解析失敗: opset_import";
+                return false;
+            }
+            if (domain.empty()) {
+                if (!kept_default) {
+                    out.insert(out.end(), src.begin() + field_start, src.begin() + field_end);
+                    kept_default = true;
+                } else {
+                    changed = true;
+                }
+            } else {
+                changed = true;
+            }
+        } else {
+            out.insert(out.end(), src.begin() + field_start, src.begin() + field_end);
+        }
+    }
+
+    if (!changed) {
+        out = std::move(src);
+    }
+    return true;
+}
+
+static bool LoadLearningModelPossiblyAbsorbed(const std::wstring& model_path, ml::LearningModel& model, std::vector<uint8_t>& absorbed_bytes, std::wstring& error) {
+    absorbed_bytes.clear();
+    bool changed = false;
+    if (!BuildWinMLCompatibleModelBytes(model_path, absorbed_bytes, changed, error)) {
+        return false;
+    }
+
+    try {
+        if (!changed) {
+            model = ml::LearningModel::LoadFromFilePath(model_path);
+            return true;
+        }
+
+        DebugOut(L"WinML absorb model: in-memory patch");
+        wss::InMemoryRandomAccessStream stream;
+        wss::DataWriter writer(stream.GetOutputStreamAt(0));
+        writer.WriteBytes(winrt::array_view<const uint8_t>(absorbed_bytes));
+        writer.StoreAsync().get();
+        writer.FlushAsync().get();
+        stream.Seek(0);
+        auto stream_ref = wss::RandomAccessStreamReference::CreateFromStream(stream);
+        model = ml::LearningModel::LoadFromStream(stream_ref);
+        return true;
+    } catch (const winrt::hresult_error& e) {
+        error = HResultErrorToString(e);
+        return false;
+    }
+}
+
+
+
+enum class ModelMode {
+    Unknown = 0,
+    SISR,
+    VSR,
+};
+
+static const wchar_t* ModelModeName(ModelMode mode) {
+    switch (mode) {
+    case ModelMode::SISR: return L"SISR";
+    case ModelMode::VSR: return L"VSR";
+    default: return L"Unknown";
+    }
+}
+
 struct ModelSpec {
     winrt::hstring input_name;
     winrt::hstring output_name;
@@ -316,10 +650,17 @@ struct ModelSpec {
     std::vector<int64_t> output_shape;
     int64_t in_c = 0;
     int64_t out_c = 0;
+    int64_t channels_per_frame = 0;
+    int64_t frame_count = 1;
     ml::TensorKind input_kind = ml::TensorKind::Undefined;
     ml::TensorKind output_kind = ml::TensorKind::Undefined;
+    ModelMode mode = ModelMode::Unknown;
     bool valid = false;
+};
 
+struct PackedFrameCache {
+    std::vector<float> f32;
+    std::vector<uint16_t> f16;
 };
 
 struct AdapterInfo {
@@ -474,11 +815,35 @@ public:
                 winrt::init_apartment(winrt::apartment_type::multi_threaded);
             });
 
-            model_ = ml::LearningModel::LoadFromFilePath(model_path);
+            DebugOut((L"Load model: " + model_path).c_str());
+            if (!LoadLearningModelPossiblyAbsorbed(model_path, model_, absorbed_model_bytes_, error)) {
+                DebugOut((L"LoadLearningModel failed: " + error).c_str());
+                Reset();
+                return false;
+            }
             model_path_ = model_path;
             model_spec_ = InspectModel(model_);
+            {
+                std::wstringstream ss;
+                ss << L"InspectModel path=" << model_path_
+                   << L" in_shape=";
+                for (size_t i = 0; i < model_spec_.input_shape.size(); ++i) {
+                    if (i) ss << L"x";
+                    ss << model_spec_.input_shape[i];
+                }
+                ss << L" out_shape=";
+                for (size_t i = 0; i < model_spec_.output_shape.size(); ++i) {
+                    if (i) ss << L"x";
+                    ss << model_spec_.output_shape[i];
+                }
+                ss << L" in_c=" << model_spec_.in_c
+                   << L" out_c=" << model_spec_.out_c
+                   << L" valid=" << (model_spec_.valid ? 1 : 0);
+                DebugOut(ss.str().c_str());
+            }
             if (!model_spec_.valid) {
                 error = L"対応外モデル: float32/float16 / 1入力1出力 / 4次元NCHWのみ対応";
+                DebugOut((L"InspectModel rejected: " + error).c_str());
                 Reset();
                 return false;
             }
@@ -548,8 +913,8 @@ public:
 
             loaded_ = true;
             return true;
-        } catch (const winrt::hresult_error&) {
-            error = L"モデルの読み込みに失敗しました";
+        } catch (const winrt::hresult_error& e) {
+            error = HResultErrorToString(e);
             Reset();
             return false;
         } catch (const std::exception& e) {
@@ -569,19 +934,43 @@ public:
         backend_name_.clear();
         selected_device_name_.clear();
         model_path_.clear();
+        absorbed_model_bytes_.clear();
         bound_input_shape_.clear();
         input_tensor_f32_ = nullptr;
         input_tensor_f16_ = nullptr;
+        bound_output_shape_.clear();
+        output_tensor_f32_ = nullptr;
+        output_tensor_f16_ = nullptr;
+        output_binding_ready_ = false;
         cached_binding_ = nullptr;
         binding_ready_ = false;
+        defer_output_binding_for_eval_ = false;
+        packed_input_f32_.clear();
+        packed_input_f16_.clear();
+        frame_scratch_f32_.clear();
+        frame_scratch_f16_.clear();
+        last_output_pixels_.clear();
+        last_output_width_ = 0;
+        last_output_height_ = 0;
+        last_window_width_ = 0;
+        last_window_height_ = 0;
+        last_sisr_input_width_ = 0;
+        last_sisr_input_height_ = 0;
+        has_last_frame_ = false;
+        last_frame_number_ = std::numeric_limits<int>::min();
+        last_object_id_ = 0;
+        last_effect_id_ = 0;
     }
 
     bool IsLoaded() const { return loaded_ && session_ != nullptr; }
+    const ModelSpec& Spec() const { return model_spec_; }
     const std::wstring& BackendName() const { return backend_name_; }
     const std::wstring& SelectedDeviceName() const { return selected_device_name_; }
     const std::wstring& ModelPath() const { return model_path_; }
 
-    bool RunPixels(const PIXEL_RGBA* src_pixels, int width, int height, std::vector<PIXEL_RGBA>& dst_pixels,
+    bool RunPixels(const PIXEL_RGBA* src_pixels, int width, int height,
+                   int object_frame, int64_t object_id, int64_t effect_id,
+                   std::vector<PIXEL_RGBA>& dst_pixels,
                    int& out_width, int& out_height, std::wstring& error) {
         out_width = 0;
         out_height = 0;
@@ -594,72 +983,245 @@ public:
             return false;
         }
 
-        const int in_c = static_cast<int>(model_spec_.in_c);
-        if (!(in_c == 3 || in_c == 4)) {
-            error = L"入力チャネル数が3/4ではありません";
-            return false;
+        if (model_spec_.mode == ModelMode::SISR) {
+            if (last_sisr_input_width_ > 0 && last_sisr_input_height_ > 0 &&
+                (last_sisr_input_width_ != width || last_sisr_input_height_ != height)) {
+                InvalidateSISRExecutionState();
+                std::wstringstream ss;
+                ss << L"SISR safe invalidate: input size changed "
+                   << last_sisr_input_width_ << L"x" << last_sisr_input_height_
+                   << L" -> " << width << L"x" << height;
+                DebugOut(ss.str().c_str());
+            }
+            last_sisr_input_width_ = width;
+            last_sisr_input_height_ = height;
         }
 
+        if (model_spec_.mode == ModelMode::VSR && has_last_frame_ &&
+            object_id == last_object_id_ && effect_id == last_effect_id_ &&
+            object_frame == last_frame_number_ &&
+            !last_output_pixels_.empty() && last_output_width_ > 0 && last_output_height_ > 0) {
+            dst_pixels = last_output_pixels_;
+            out_width = last_output_width_;
+            out_height = last_output_height_;
+            error.clear();
+            DebugOut(L"VSR cache hit: repeated frame reuse");
+            return true;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        long long ms_shape = 0;
+        long long ms_tensor = 0;
+        long long ms_window = 0;
+        long long ms_pack = 0;
+        long long ms_bind = 0;
+        long long ms_eval = 0;
+        long long ms_lookup = 0;
+        long long ms_validate = 0;
+        long long ms_unpack = 0;
+
+        const int in_c = static_cast<int>(model_spec_.in_c);
+        auto ts = std::chrono::steady_clock::now();
         auto input_shape = ResolveInputShape(width, height);
         if (input_shape.size() != 4) {
             error = L"入力shape解決失敗";
             return false;
         }
+        ms_shape = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
 
+        ts = std::chrono::steady_clock::now();
         if (!EnsureInputTensor(input_shape, error)) {
             return false;
         }
+        ms_tensor = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
 
-        if (model_spec_.input_kind == ml::TensorKind::Float16) {
-            if (!FillInputTensorFloat16(src_pixels, width, height, in_c, error)) {
+        if (model_spec_.mode == ModelMode::SISR) {
+            if (!(in_c == 1 || in_c == 3 || in_c == 4)) {
+                error = L"入力チャネル数が1/3/4ではありません";
                 return false;
             }
+            ts = std::chrono::steady_clock::now();
+            if (model_spec_.input_kind == ml::TensorKind::Float16) {
+                if (!FillInputTensorFloat16(src_pixels, width, height, in_c, error)) {
+                    return false;
+                }
+            } else {
+                if (!FillInputTensorFloat32(src_pixels, width, height, in_c, error)) {
+                    return false;
+                }
+            }
+            ms_pack = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+        } else if (model_spec_.mode == ModelMode::VSR) {
+            const int frame_count = static_cast<int>(std::max<int64_t>(1, model_spec_.frame_count));
+            const int channels_per_frame = static_cast<int>(std::max<int64_t>(1, model_spec_.channels_per_frame));
+            if (!((channels_per_frame == 3 || channels_per_frame == 4) && frame_count >= 1)) {
+                error = L"VSR入力チャネル構成に未対応です";
+                return false;
+            }
+
+            ts = std::chrono::steady_clock::now();
+            PrepareTemporalWindow(src_pixels, width, height, frame_count, object_frame, object_id, effect_id);
+            ms_window = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+
+            ts = std::chrono::steady_clock::now();
+            if (model_spec_.input_kind == ml::TensorKind::Float16) {
+                if (!FillPackedInputTensorFloat16(packed_input_f16_, error)) {
+                    return false;
+                }
+            } else {
+                if (!FillPackedInputTensorFloat32(packed_input_f32_, error)) {
+                    return false;
+                }
+            }
+            ms_pack = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
         } else {
-            if (!FillInputTensorFloat32(src_pixels, width, height, in_c, error)) {
-                return false;
-            }
-        }
-        if (!EnsureInputBinding(error)) {
+            error = L"対応外モデルです";
             return false;
         }
 
-        auto result = session_.Evaluate(cached_binding_, L"AI S-R ONNX");
-        auto outputs = result.Outputs();
-        winrt::Windows::Foundation::IInspectable boxed{ nullptr };
+        ts = std::chrono::steady_clock::now();
+        auto guessed_output_shape = GuessOutputShape(input_shape);
+        if (!guessed_output_shape.empty()) {
+            std::wstring out_err;
+            EnsureOutputTensorForShape(guessed_output_shape, out_err);
+        }
+        if (!EnsureBindings(error)) {
+            return false;
+        }
+        ms_bind = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+
+        ts = std::chrono::steady_clock::now();
+        decltype(session_.Evaluate(cached_binding_, L"AI S-R ONNX")) result{ nullptr };
         try {
-            boxed = outputs.Lookup(model_spec_.output_name);
-        } catch (const winrt::hresult_error&) {
-            error = L"出力名が見つかりません";
-            return false;
+            result = session_.Evaluate(cached_binding_, L"AI S-R ONNX");
+        } catch (const winrt::hresult_error& e) {
+            const std::wstring first_error = HResultErrorToString(e);
+            if (!defer_output_binding_for_eval_ && model_spec_.mode == ModelMode::SISR) {
+                DebugOut((L"Evaluate failed, retry without prebound output path=" + model_path_ + L" err=" + first_error).c_str());
+                defer_output_binding_for_eval_ = true;
+                output_binding_ready_ = false;
+                output_tensor_f32_ = nullptr;
+                output_tensor_f16_ = nullptr;
+                cached_binding_ = nullptr;
+                binding_ready_ = false;
+                std::wstring retry_bind_error;
+                if (!EnsureBindings(retry_bind_error)) {
+                    error = retry_bind_error;
+                    return false;
+                }
+                try {
+                    result = session_.Evaluate(cached_binding_, L"AI S-R ONNX");
+                } catch (const winrt::hresult_error& e2) {
+                    error = L"Evaluate失敗: " + HResultErrorToString(e2);
+                    DebugOut((L"Evaluate failed after retry path=" + model_path_ + L" err=" + error).c_str());
+                    return false;
+                }
+            } else {
+                error = L"Evaluate失敗: " + first_error;
+                DebugOut((L"Evaluate failed path=" + model_path_ + L" err=" + error).c_str());
+                return false;
+            }
         }
+        ms_eval = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+
         if (model_spec_.output_kind == ml::TensorKind::Float16) {
-            auto out_tensor = boxed.try_as<ml::TensorFloat16Bit>();
-            if (!out_tensor) {
-                error = L"出力テンソルがTensorFloat16Bitではありません";
-                return false;
+            ml::TensorFloat16Bit out_tensor{ nullptr };
+            std::vector<int64_t> out_shape;
+            ts = std::chrono::steady_clock::now();
+            if (output_binding_ready_ && output_tensor_f16_) {
+                out_tensor = output_tensor_f16_;
+                out_shape = bound_output_shape_;
+            } else {
+                auto outputs = result.Outputs();
+                winrt::Windows::Foundation::IInspectable boxed{ nullptr };
+                try {
+                    boxed = outputs.Lookup(model_spec_.output_name);
+                } catch (const winrt::hresult_error&) {
+                    error = L"出力名が見つかりません";
+                    return false;
+                }
+                out_tensor = boxed.try_as<ml::TensorFloat16Bit>();
+                if (!out_tensor) {
+                    error = L"出力テンソルがTensorFloat16Bitではありません";
+                    return false;
+                }
+                out_shape = ToStdVector(out_tensor.Shape());
+                EnsureOutputTensorForShape(out_shape, error);
             }
-            auto out_shape = ToStdVector(out_tensor.Shape());
+            ms_lookup = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+            ts = std::chrono::steady_clock::now();
             if (!ValidateOutputShape(out_shape, out_width, out_height, error)) {
                 return false;
             }
-            if (!UnpackOutputTensorFloat16(out_tensor, out_width, out_height, static_cast<int>(out_shape[1]), dst_pixels, error)) {
+            ms_validate = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+            ts = std::chrono::steady_clock::now();
+            if (!UnpackOutputTensorFloat16(out_tensor, out_width, out_height, static_cast<int>(out_shape[1]), dst_pixels, error,
+                                          src_pixels, width, height)) {
                 return false;
             }
+            ms_unpack = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
         } else {
-            auto out_tensor = boxed.try_as<ml::TensorFloat>();
-            if (!out_tensor) {
-                error = L"出力テンソルがTensorFloatではありません";
-                return false;
+            ml::TensorFloat out_tensor{ nullptr };
+            std::vector<int64_t> out_shape;
+            ts = std::chrono::steady_clock::now();
+            if (output_binding_ready_ && output_tensor_f32_) {
+                out_tensor = output_tensor_f32_;
+                out_shape = bound_output_shape_;
+            } else {
+                auto outputs = result.Outputs();
+                winrt::Windows::Foundation::IInspectable boxed{ nullptr };
+                try {
+                    boxed = outputs.Lookup(model_spec_.output_name);
+                } catch (const winrt::hresult_error&) {
+                    error = L"出力名が見つかりません";
+                    return false;
+                }
+                out_tensor = boxed.try_as<ml::TensorFloat>();
+                if (!out_tensor) {
+                    error = L"出力テンソルがTensorFloatではありません";
+                    return false;
+                }
+                out_shape = ToStdVector(out_tensor.Shape());
+                EnsureOutputTensorForShape(out_shape, error);
             }
-            auto out_shape = ToStdVector(out_tensor.Shape());
+            ms_lookup = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+            ts = std::chrono::steady_clock::now();
             if (!ValidateOutputShape(out_shape, out_width, out_height, error)) {
                 return false;
             }
-            if (!UnpackOutputTensorFloat32(out_tensor, out_width, out_height, static_cast<int>(out_shape[1]), dst_pixels, error)) {
+            ms_validate = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
+            ts = std::chrono::steady_clock::now();
+            if (!UnpackOutputTensorFloat32(out_tensor, out_width, out_height, static_cast<int>(out_shape[1]), dst_pixels, error,
+                                          src_pixels, width, height)) {
                 return false;
             }
+            ms_unpack = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ts).count();
         }
 
+        if (model_spec_.mode == ModelMode::VSR) {
+            last_output_pixels_ = dst_pixels;
+            last_output_width_ = out_width;
+            last_output_height_ = out_height;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        {
+            std::wstringstream ss;
+            ss << L"RunPixels mode=" << ModelModeName(model_spec_.mode)
+               << L" total=" << ms
+               << L" shape=" << ms_shape
+               << L" tensor=" << ms_tensor
+               << L" window=" << ms_window
+               << L" pack=" << ms_pack
+               << L" bind=" << ms_bind
+               << L" eval=" << ms_eval
+               << L" outbind=" << (output_binding_ready_ ? 1 : 0)
+               << L" deferred_out=" << (defer_output_binding_for_eval_ ? 1 : 0)
+               << L" lookup=" << ms_lookup
+               << L" validate=" << ms_validate
+               << L" unpack=" << ms_unpack;
+            DebugOutHotPath(ss.str().c_str());
+        }
         error.clear();
         return true;
     }
@@ -699,11 +1261,32 @@ private:
 
         spec.in_c = spec.input_shape[1];
         spec.out_c = spec.output_shape[1];
-        if (!(spec.in_c == 3 || spec.in_c == 4 || spec.in_c <= 0)) return spec;
-        if (!(spec.out_c == 3 || spec.out_c == 4 || spec.out_c <= 0)) return spec;
+        if (spec.in_c <= 0) return spec;
 
-        if (spec.in_c <= 0) spec.in_c = 3;
-        if (spec.out_c <= 0) spec.out_c = 3;
+        if (spec.out_c <= 0 && (spec.in_c == 1 || spec.in_c == 3 || spec.in_c == 4)) {
+            // Some SISR ONNX export paths leave output channel symbolic in the graph metadata.
+            // In practice these models usually preserve channel count, so accept them here.
+            spec.out_c = spec.in_c;
+        }
+        if (spec.out_c <= 0) return spec;
+
+        if (spec.in_c == 1 || spec.in_c == 3 || spec.in_c == 4) {
+            spec.mode = ModelMode::SISR;
+            spec.frame_count = 1;
+            spec.channels_per_frame = spec.in_c;
+        } else if ((spec.in_c % 3) == 0) {
+            spec.mode = ModelMode::VSR;
+            spec.channels_per_frame = 3;
+            spec.frame_count = spec.in_c / 3;
+        } else if ((spec.in_c % 4) == 0) {
+            spec.mode = ModelMode::VSR;
+            spec.channels_per_frame = 4;
+            spec.frame_count = spec.in_c / 4;
+        } else {
+            return spec;
+        }
+
+        if (!(spec.out_c == 1 || spec.out_c == 3 || spec.out_c == 4)) return spec;
         spec.valid = true;
         return spec;
     }
@@ -723,6 +1306,43 @@ private:
         if (s[2] <= 0) s[2] = h;
         if (s[3] <= 0) s[3] = w;
         return s;
+    }
+
+    std::vector<int64_t> GuessOutputShape(const std::vector<int64_t>& input_shape) const {
+        if (model_spec_.output_shape.size() != 4 || input_shape.size() != 4) return {};
+        auto out = model_spec_.output_shape;
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) {
+            if (out[i] > 0) continue;
+            if (i == 0) out[i] = 1;
+            else if (i == 1) out[i] = model_spec_.out_c;
+            else if (model_spec_.input_shape[i] > 0 && input_shape[i] > 0 && out[i] == model_spec_.output_shape[i]) {
+                ok = false;
+            }
+        }
+        auto scale_dim = [&](int idx) -> int64_t {
+            const auto in_decl = model_spec_.input_shape[idx];
+            const auto out_decl = model_spec_.output_shape[idx];
+            const auto in_now = input_shape[idx];
+            if (in_decl > 0 && out_decl > 0 && in_now > 0) {
+                return (out_decl * in_now) / in_decl;
+            }
+            return -1;
+        };
+        if (out[2] <= 0) {
+            auto v = scale_dim(2);
+            if (v > 0) out[2] = v;
+            else ok = false;
+        }
+        if (out[3] <= 0) {
+            auto v = scale_dim(3);
+            if (v > 0) out[3] = v;
+            else ok = false;
+        }
+        if (out[0] <= 0) out[0] = 1;
+        if (out[1] <= 0) out[1] = model_spec_.out_c;
+        if (!ok) return {};
+        return out;
     }
 
     bool EnsureInputTensor(const std::vector<int64_t>& input_shape, std::wstring& error) {
@@ -749,12 +1369,13 @@ private:
         }
     }
 
-    // Cache input binding only. Output binding stays dynamic for stability.
-    bool EnsureInputBinding(std::wstring& error) {
+    // Cache input/output binding.
+    bool EnsureBindings(std::wstring& error) {
         try {
             if (!cached_binding_) {
                 cached_binding_ = ml::LearningModelBinding(session_);
                 binding_ready_ = false;
+                output_binding_ready_ = false;
             }
             if (!binding_ready_) {
                 if (model_spec_.input_kind == ml::TensorKind::Float16) {
@@ -764,14 +1385,56 @@ private:
                 }
                 binding_ready_ = true;
             }
+            if (!defer_output_binding_for_eval_ && !bound_output_shape_.empty() && !output_binding_ready_) {
+                if (model_spec_.output_kind == ml::TensorKind::Float16) {
+                    if (!output_tensor_f16_) output_tensor_f16_ = ml::TensorFloat16Bit::Create(bound_output_shape_);
+                    cached_binding_.Bind(model_spec_.output_name, output_tensor_f16_);
+                } else {
+                    if (!output_tensor_f32_) output_tensor_f32_ = ml::TensorFloat::Create(bound_output_shape_);
+                    cached_binding_.Bind(model_spec_.output_name, output_tensor_f32_);
+                }
+                output_binding_ready_ = true;
+            }
             return true;
         } catch (const winrt::hresult_error& e) {
-            error = L"入力バインド作成失敗: " + HResultErrorToString(e);
+            error = L"入出力バインド作成失敗: " + HResultErrorToString(e);
             cached_binding_ = nullptr;
             binding_ready_ = false;
+            output_binding_ready_ = false;
             return false;
         }
     }
+
+    bool EnsureOutputTensorForShape(const std::vector<int64_t>& out_shape, std::wstring& error) {
+        try {
+            if (out_shape == bound_output_shape_) return true;
+            bound_output_shape_ = out_shape;
+            output_tensor_f32_ = nullptr;
+            output_tensor_f16_ = nullptr;
+            output_binding_ready_ = false;
+            if (cached_binding_) {
+                if (model_spec_.output_kind == ml::TensorKind::Float16) {
+                    output_tensor_f16_ = ml::TensorFloat16Bit::Create(bound_output_shape_);
+                    cached_binding_.Bind(model_spec_.output_name, output_tensor_f16_);
+                } else {
+                    output_tensor_f32_ = ml::TensorFloat::Create(bound_output_shape_);
+                    cached_binding_.Bind(model_spec_.output_name, output_tensor_f32_);
+                }
+                output_binding_ready_ = true;
+            }
+            return true;
+        } catch (const winrt::hresult_error& e) {
+            error = L"出力テンソル作成失敗: " + HResultErrorToString(e);
+            bound_output_shape_.clear();
+            output_tensor_f32_ = nullptr;
+            output_tensor_f16_ = nullptr;
+            output_binding_ready_ = false;
+            return false;
+        }
+    }
+
+
+
 
 
     static bool ValidateOutputShape(const std::vector<int64_t>& out_shape, int& out_width, int& out_height, std::wstring& error) {
@@ -784,7 +1447,7 @@ private:
         const int out_c = static_cast<int>(out_shape[1]);
         const int out_h = static_cast<int>(out_shape[2]);
         const int out_w = static_cast<int>(out_shape[3]);
-        if (out_n != 1 || !(out_c == 3 || out_c == 4) || out_w <= 0 || out_h <= 0) {
+        if (out_n != 1 || !(out_c == 1 || out_c == 3 || out_c == 4) || out_w <= 0 || out_h <= 0) {
             error = L"出力shape想定外";
             return false;
         }
@@ -801,7 +1464,6 @@ private:
         return true;
     }
 
-    // Pack planar NCHW input into the already-allocated WinML tensor.
     static bool FillTensorFloatBuffer(const ml::TensorFloat& tensor, const PIXEL_RGBA* src_pixels, int w, int h, int channels, std::wstring& error) {
         try {
             auto ref = tensor.CreateReference();
@@ -841,7 +1503,7 @@ private:
                     }
                 };
                 RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
-            } else {
+            } else if (channels == 3) {
                 auto work = [&](int y0, int y1) {
                     for (int y = y0; y < y1; ++y) {
                         const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
@@ -858,6 +1520,23 @@ private:
                     }
                 };
                 RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            } else if (channels == 1) {
+                auto work = [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                        const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                        float* __restrict yrow = out + row_base;
+                        for (int x = 0; x < w; ++x) {
+                            const PIXEL_RGBA& s = srow[x];
+                            const int gray = (77 * int(s.r) + 150 * int(s.g) + 29 * int(s.b) + 128) >> 8;
+                            yrow[x] = lut.f32[gray];
+                        }
+                    }
+                };
+                RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            } else {
+                error = L"TensorFloat 未対応チャネル数";
+                return false;
             }
             return true;
         } catch (const winrt::hresult_error& e) {
@@ -905,7 +1584,7 @@ private:
                     }
                 };
                 RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
-            } else {
+            } else if (channels == 3) {
                 auto work = [&](int y0, int y1) {
                     for (int y = y0; y < y1; ++y) {
                         const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
@@ -922,6 +1601,23 @@ private:
                     }
                 };
                 RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            } else if (channels == 1) {
+                auto work = [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                        const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                        uint16_t* __restrict yrow = out + row_base;
+                        for (int x = 0; x < w; ++x) {
+                            const PIXEL_RGBA& s = srow[x];
+                            const int gray = (77 * int(s.r) + 150 * int(s.g) + 29 * int(s.b) + 128) >> 8;
+                            yrow[x] = lut.f16[gray];
+                        }
+                    }
+                };
+                RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            } else {
+                error = L"TensorFloat16Bit 未対応チャネル数";
+                return false;
             }
             return true;
         } catch (const winrt::hresult_error& e) {
@@ -938,7 +1634,8 @@ private:
         return FillTensorFloat16Buffer(input_tensor_f16_, src_pixels, w, h, channels, error);
     }
 
-    static void UnpackFromFloatBuffer(const float* src, int w, int h, int channels, std::vector<PIXEL_RGBA>& out_pixels) {
+    static void UnpackFromFloatBuffer(const float* src, int w, int h, int channels, std::vector<PIXEL_RGBA>& out_pixels,
+                                     const PIXEL_RGBA* src_pixels = nullptr, int src_w = 0, int src_h = 0) {
         const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
         const size_t plane2 = plane * 2;
         const size_t plane3 = plane * 3;
@@ -962,7 +1659,7 @@ private:
                 }
             };
             RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
-        } else {
+        } else if (channels == 3) {
             auto work = [&](int y0, int y1) {
                 for (int y = y0; y < y1; ++y) {
                     const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
@@ -980,10 +1677,75 @@ private:
                 }
             };
             RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        } else if (channels == 1) {
+            if (src_pixels && src_w > 0 && src_h > 0) {
+                auto sample_chroma = [&](float sx, float sy, bool cb) -> float {
+                    sx = std::clamp(sx, 0.0f, static_cast<float>(src_w - 1));
+                    sy = std::clamp(sy, 0.0f, static_cast<float>(src_h - 1));
+                    const int x0 = static_cast<int>(sx);
+                    const int y0 = static_cast<int>(sy);
+                    const int x1 = std::min(x0 + 1, src_w - 1);
+                    const int y1 = std::min(y0 + 1, src_h - 1);
+                    const float fx = sx - static_cast<float>(x0);
+                    const float fy = sy - static_cast<float>(y0);
+                    const auto& p00 = src_pixels[static_cast<size_t>(y0) * static_cast<size_t>(src_w) + static_cast<size_t>(x0)];
+                    const auto& p10 = src_pixels[static_cast<size_t>(y0) * static_cast<size_t>(src_w) + static_cast<size_t>(x1)];
+                    const auto& p01 = src_pixels[static_cast<size_t>(y1) * static_cast<size_t>(src_w) + static_cast<size_t>(x0)];
+                    const auto& p11 = src_pixels[static_cast<size_t>(y1) * static_cast<size_t>(src_w) + static_cast<size_t>(x1)];
+                    const float c00 = cb ? PixelCb01(p00) : PixelCr01(p00);
+                    const float c10 = cb ? PixelCb01(p10) : PixelCr01(p10);
+                    const float c01 = cb ? PixelCb01(p01) : PixelCr01(p01);
+                    const float c11 = cb ? PixelCb01(p11) : PixelCr01(p11);
+                    const float c0 = c00 + (c10 - c00) * fx;
+                    const float c1 = c01 + (c11 - c01) * fx;
+                    return c0 + (c1 - c0) * fy;
+                };
+                auto work = [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                        PIXEL_RGBA* __restrict drow = out_pixels.data() + row_base;
+                        const float* __restrict yrow = src + row_base;
+                        const float sy = ((static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(h)) - 0.5f;
+                        for (int x = 0; x < w; ++x) {
+                            const float yv = Clamp01(yrow[x]);
+                            const float sx = ((static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(w)) - 0.5f;
+                            const float cb = sample_chroma(sx, sy, true);
+                            const float cr = sample_chroma(sx, sy, false);
+                            const float r = Clamp01(yv + 1.402f * (cr - 0.5f));
+                            const float g = Clamp01(yv - 0.344136f * (cb - 0.5f) - 0.714136f * (cr - 0.5f));
+                            const float b = Clamp01(yv + 1.772f * (cb - 0.5f));
+                            PIXEL_RGBA& d = drow[x];
+                            d.r = FastClampToU8(r);
+                            d.g = FastClampToU8(g);
+                            d.b = FastClampToU8(b);
+                            d.a = 255;
+                        }
+                    }
+                };
+                RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            } else {
+                auto work = [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                        PIXEL_RGBA* __restrict drow = out_pixels.data() + row_base;
+                        const float* __restrict yrow = src + row_base;
+                        for (int x = 0; x < w; ++x) {
+                            const uint8_t v = FastClampToU8(yrow[x]);
+                            PIXEL_RGBA& d = drow[x];
+                            d.r = v;
+                            d.g = v;
+                            d.b = v;
+                            d.a = 255;
+                        }
+                    }
+                };
+                RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            }
         }
     }
 
-    static void UnpackFromFloat16Buffer(const uint16_t* src, int w, int h, int channels, std::vector<PIXEL_RGBA>& out_pixels) {
+    static void UnpackFromFloat16Buffer(const uint16_t* src, int w, int h, int channels, std::vector<PIXEL_RGBA>& out_pixels,
+                                       const PIXEL_RGBA* src_pixels = nullptr, int src_w = 0, int src_h = 0) {
         const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
         const size_t plane2 = plane * 2;
         const size_t plane3 = plane * 3;
@@ -1008,7 +1770,7 @@ private:
                 }
             };
             RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
-        } else {
+        } else if (channels == 3) {
             auto work = [&](int y0, int y1) {
                 for (int y = y0; y < y1; ++y) {
                     const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
@@ -1026,11 +1788,375 @@ private:
                 }
             };
             RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        } else if (channels == 1) {
+            if (src_pixels && src_w > 0 && src_h > 0) {
+                auto sample_chroma = [&](float sx, float sy, bool cb) -> float {
+                    sx = std::clamp(sx, 0.0f, static_cast<float>(src_w - 1));
+                    sy = std::clamp(sy, 0.0f, static_cast<float>(src_h - 1));
+                    const int x0 = static_cast<int>(sx);
+                    const int y0 = static_cast<int>(sy);
+                    const int x1 = std::min(x0 + 1, src_w - 1);
+                    const int y1 = std::min(y0 + 1, src_h - 1);
+                    const float fx = sx - static_cast<float>(x0);
+                    const float fy = sy - static_cast<float>(y0);
+                    const auto& p00 = src_pixels[static_cast<size_t>(y0) * static_cast<size_t>(src_w) + static_cast<size_t>(x0)];
+                    const auto& p10 = src_pixels[static_cast<size_t>(y0) * static_cast<size_t>(src_w) + static_cast<size_t>(x1)];
+                    const auto& p01 = src_pixels[static_cast<size_t>(y1) * static_cast<size_t>(src_w) + static_cast<size_t>(x0)];
+                    const auto& p11 = src_pixels[static_cast<size_t>(y1) * static_cast<size_t>(src_w) + static_cast<size_t>(x1)];
+                    const float c00 = cb ? PixelCb01(p00) : PixelCr01(p00);
+                    const float c10 = cb ? PixelCb01(p10) : PixelCr01(p10);
+                    const float c01 = cb ? PixelCb01(p01) : PixelCr01(p01);
+                    const float c11 = cb ? PixelCb01(p11) : PixelCr01(p11);
+                    const float c0 = c00 + (c10 - c00) * fx;
+                    const float c1 = c01 + (c11 - c01) * fx;
+                    return c0 + (c1 - c0) * fy;
+                };
+                auto work = [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                        PIXEL_RGBA* __restrict drow = out_pixels.data() + row_base;
+                        const uint16_t* __restrict yrow = src + row_base;
+                        const float sy = ((static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(h)) - 0.5f;
+                        for (int x = 0; x < w; ++x) {
+                            const float yv = static_cast<float>(lut.half_to_u8[yrow[x]]) * (1.0f / 255.0f);
+                            const float sx = ((static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(w)) - 0.5f;
+                            const float cb = sample_chroma(sx, sy, true);
+                            const float cr = sample_chroma(sx, sy, false);
+                            const float r = Clamp01(yv + 1.402f * (cr - 0.5f));
+                            const float g = Clamp01(yv - 0.344136f * (cb - 0.5f) - 0.714136f * (cr - 0.5f));
+                            const float b = Clamp01(yv + 1.772f * (cb - 0.5f));
+                            PIXEL_RGBA& d = drow[x];
+                            d.r = FastClampToU8(r);
+                            d.g = FastClampToU8(g);
+                            d.b = FastClampToU8(b);
+                            d.a = 255;
+                        }
+                    }
+                };
+                RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            } else {
+                auto work = [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                        PIXEL_RGBA* __restrict drow = out_pixels.data() + row_base;
+                        const uint16_t* __restrict yrow = src + row_base;
+                        for (int x = 0; x < w; ++x) {
+                            const uint8_t v = lut.half_to_u8[yrow[x]];
+                            PIXEL_RGBA& d = drow[x];
+                            d.r = v;
+                            d.g = v;
+                            d.b = v;
+                            d.a = 255;
+                        }
+                    }
+                };
+                RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+            }
+        }
+    }
+    static bool FillPackedTensorFloatBuffer(const ml::TensorFloat& tensor, const std::vector<float>& packed, std::wstring& error) {
+        try {
+            auto ref = tensor.CreateReference();
+            auto access = ref.as<IMemoryBufferByteAccess>();
+            BYTE* bytes = nullptr;
+            UINT32 capacity = 0;
+            if (FAILED(access->GetBuffer(&bytes, &capacity)) || !bytes) {
+                error = L"TensorFloat バッファ取得失敗";
+                return false;
+            }
+            const size_t needed = packed.size() * sizeof(float);
+            if (capacity < needed) {
+                error = L"TensorFloat バッファサイズ不足";
+                return false;
+            }
+            std::memcpy(bytes, packed.data(), needed);
+            return true;
+        } catch (const winrt::hresult_error& e) {
+            error = L"TensorFloat 書き込み失敗: " + HResultErrorToString(e);
+            return false;
+        }
+    }
+
+    static bool FillPackedTensorFloat16Buffer(const ml::TensorFloat16Bit& tensor, const std::vector<uint16_t>& packed, std::wstring& error) {
+        try {
+            auto ref = tensor.CreateReference();
+            auto access = ref.as<IMemoryBufferByteAccess>();
+            BYTE* bytes = nullptr;
+            UINT32 capacity = 0;
+            if (FAILED(access->GetBuffer(&bytes, &capacity)) || !bytes) {
+                error = L"TensorFloat16Bit バッファ取得失敗";
+                return false;
+            }
+            const size_t needed = packed.size() * sizeof(uint16_t);
+            if (capacity < needed) {
+                error = L"TensorFloat16Bit バッファサイズ不足";
+                return false;
+            }
+            std::memcpy(bytes, packed.data(), needed);
+            return true;
+        } catch (const winrt::hresult_error& e) {
+            error = L"TensorFloat16Bit 書き込み失敗: " + HResultErrorToString(e);
+            return false;
+        }
+    }
+
+    bool FillPackedInputTensorFloat32(const std::vector<float>& packed, std::wstring& error) {
+        return FillPackedTensorFloatBuffer(input_tensor_f32_, packed, error);
+    }
+
+    bool FillPackedInputTensorFloat16(const std::vector<uint16_t>& packed, std::wstring& error) {
+        return FillPackedTensorFloat16Buffer(input_tensor_f16_, packed, error);
+    }
+
+    static void PackSingleFrameFloat(const PIXEL_RGBA* src_pixels, int w, int h, int channels_per_frame, std::vector<float>& out) {
+        const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const size_t needed = plane * static_cast<size_t>(channels_per_frame);
+        if (out.size() != needed) out.resize(needed);
+        const auto& lut = GetScalarLUTs();
+        const size_t plane2 = plane * 2;
+        const size_t plane3 = plane * 3;
+        if (channels_per_frame == 4) {
+            auto work = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                    const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                    float* __restrict rrow = out.data() + row_base;
+                    float* __restrict grow = out.data() + plane + row_base;
+                    float* __restrict brow = out.data() + plane2 + row_base;
+                    float* __restrict arow = out.data() + plane3 + row_base;
+                    for (int x = 0; x < w; ++x) {
+                        const PIXEL_RGBA& s = srow[x];
+                        rrow[x] = lut.f32[s.r];
+                        grow[x] = lut.f32[s.g];
+                        brow[x] = lut.f32[s.b];
+                        arow[x] = lut.f32[s.a];
+                    }
+                }
+            };
+            RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        } else if (channels_per_frame == 3) {
+            auto work = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                    const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                    float* __restrict rrow = out.data() + row_base;
+                    float* __restrict grow = out.data() + plane + row_base;
+                    float* __restrict brow = out.data() + plane2 + row_base;
+                    for (int x = 0; x < w; ++x) {
+                        const PIXEL_RGBA& s = srow[x];
+                        rrow[x] = lut.f32[s.r];
+                        grow[x] = lut.f32[s.g];
+                        brow[x] = lut.f32[s.b];
+                    }
+                }
+            };
+            RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        } else if (channels_per_frame == 1) {
+            auto work = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                    const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                    float* __restrict yrow = out.data() + row_base;
+                    for (int x = 0; x < w; ++x) {
+                        const PIXEL_RGBA& s = srow[x];
+                        const int gray = (77 * int(s.r) + 150 * int(s.g) + 29 * int(s.b) + 128) >> 8;
+                        yrow[x] = lut.f32[gray];
+                    }
+                }
+            };
+            RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        }
+    }
+
+    static void PackSingleFrameHalf(const PIXEL_RGBA* src_pixels, int w, int h, int channels_per_frame, std::vector<uint16_t>& out) {
+        const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const size_t needed = plane * static_cast<size_t>(channels_per_frame);
+        if (out.size() != needed) out.resize(needed);
+        const auto& lut = GetScalarLUTs();
+        const size_t plane2 = plane * 2;
+        const size_t plane3 = plane * 3;
+        if (channels_per_frame == 4) {
+            auto work = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                    const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                    uint16_t* __restrict rrow = out.data() + row_base;
+                    uint16_t* __restrict grow = out.data() + plane + row_base;
+                    uint16_t* __restrict brow = out.data() + plane2 + row_base;
+                    uint16_t* __restrict arow = out.data() + plane3 + row_base;
+                    for (int x = 0; x < w; ++x) {
+                        const PIXEL_RGBA& s = srow[x];
+                        rrow[x] = lut.f16[s.r];
+                        grow[x] = lut.f16[s.g];
+                        brow[x] = lut.f16[s.b];
+                        arow[x] = lut.f16[s.a];
+                    }
+                }
+            };
+            RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        } else if (channels_per_frame == 3) {
+            auto work = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                    const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                    uint16_t* __restrict rrow = out.data() + row_base;
+                    uint16_t* __restrict grow = out.data() + plane + row_base;
+                    uint16_t* __restrict brow = out.data() + plane2 + row_base;
+                    for (int x = 0; x < w; ++x) {
+                        const PIXEL_RGBA& s = srow[x];
+                        rrow[x] = lut.f16[s.r];
+                        grow[x] = lut.f16[s.g];
+                        brow[x] = lut.f16[s.b];
+                    }
+                }
+            };
+            RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        } else if (channels_per_frame == 1) {
+            auto work = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(w);
+                    const PIXEL_RGBA* __restrict srow = src_pixels + row_base;
+                    uint16_t* __restrict yrow = out.data() + row_base;
+                    for (int x = 0; x < w; ++x) {
+                        const PIXEL_RGBA& s = srow[x];
+                        const int gray = (77 * int(s.r) + 150 * int(s.g) + 29 * int(s.b) + 128) >> 8;
+                        yrow[x] = lut.f16[gray];
+                    }
+                }
+            };
+            RowThreadPool::Instance().ParallelForRows(h, ChooseMinRowsPerTask(w, h), work);
+        }
+    }
+
+    void PrepareTemporalWindow(const PIXEL_RGBA* src_pixels, int w, int h, int frame_count,
+                              int object_frame, int64_t object_id, int64_t effect_id) {
+        const bool size_changed = (w != last_window_width_ || h != last_window_height_);
+        const bool object_changed = (object_id != last_object_id_ || effect_id != last_effect_id_);
+        const bool first_frame = !has_last_frame_;
+        const bool repeated_frame = has_last_frame_ && object_frame == last_frame_number_;
+        const bool sequential_frame = has_last_frame_ && object_frame == (last_frame_number_ + 1);
+        const bool discontinuous_frame = !(first_frame || repeated_frame || sequential_frame);
+
+        const int channels_per_frame = static_cast<int>(model_spec_.channels_per_frame);
+        const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const size_t frame_elems = plane * static_cast<size_t>(channels_per_frame);
+        const size_t total_elems = frame_elems * static_cast<size_t>(std::max(frame_count, 1));
+
+        if (size_changed || object_changed || discontinuous_frame) {
+            packed_input_f32_.clear();
+            packed_input_f16_.clear();
+            last_output_pixels_.clear();
+            last_output_width_ = 0;
+            last_output_height_ = 0;
+            last_window_width_ = w;
+            last_window_height_ = h;
+            DebugOutHotPath((std::wstring(L"vsr window init frame=") + std::to_wstring(object_frame) + L" size=" + std::to_wstring(frame_count)).c_str());
+        }
+
+        if (model_spec_.input_kind == ml::TensorKind::Float16) {
+            PackSingleFrameHalf(src_pixels, w, h, channels_per_frame, frame_scratch_f16_);
+            auto& current = frame_scratch_f16_;
+
+            if (repeated_frame && packed_input_f16_.size() == total_elems) {
+                DebugOutHotPath((std::wstring(L"vsr window frame=") + std::to_wstring(object_frame) + L" repeated=1 sequential=0 count=" + std::to_wstring(frame_count)).c_str());
+                return;
+            }
+
+            if (packed_input_f16_.size() != total_elems) packed_input_f16_.resize(total_elems);
+
+            if (first_frame || object_changed || discontinuous_frame || size_changed) {
+                for (int i = 0; i < frame_count; ++i) {
+                    std::memcpy(packed_input_f16_.data() + static_cast<size_t>(i) * frame_elems,
+                                current.data(), frame_elems * sizeof(uint16_t));
+                }
+            } else if (sequential_frame) {
+                if (frame_count > 1) {
+                    std::memmove(packed_input_f16_.data(),
+                                 packed_input_f16_.data() + frame_elems,
+                                 (static_cast<size_t>(frame_count - 1) * frame_elems) * sizeof(uint16_t));
+                }
+                std::memcpy(packed_input_f16_.data() + static_cast<size_t>(frame_count - 1) * frame_elems,
+                            current.data(), frame_elems * sizeof(uint16_t));
+            } else {
+                for (int i = 0; i < frame_count; ++i) {
+                    std::memcpy(packed_input_f16_.data() + static_cast<size_t>(i) * frame_elems,
+                                current.data(), frame_elems * sizeof(uint16_t));
+                }
+            }
+        } else {
+            PackSingleFrameFloat(src_pixels, w, h, channels_per_frame, frame_scratch_f32_);
+            auto& current = frame_scratch_f32_;
+
+            if (repeated_frame && packed_input_f32_.size() == total_elems) {
+                DebugOutHotPath((std::wstring(L"vsr window frame=") + std::to_wstring(object_frame) + L" repeated=1 sequential=0 count=" + std::to_wstring(frame_count)).c_str());
+                return;
+            }
+
+            if (packed_input_f32_.size() != total_elems) packed_input_f32_.resize(total_elems);
+
+            if (first_frame || object_changed || discontinuous_frame || size_changed) {
+                for (int i = 0; i < frame_count; ++i) {
+                    std::memcpy(packed_input_f32_.data() + static_cast<size_t>(i) * frame_elems,
+                                current.data(), frame_elems * sizeof(float));
+                }
+            } else if (sequential_frame) {
+                if (frame_count > 1) {
+                    std::memmove(packed_input_f32_.data(),
+                                 packed_input_f32_.data() + frame_elems,
+                                 (static_cast<size_t>(frame_count - 1) * frame_elems) * sizeof(float));
+                }
+                std::memcpy(packed_input_f32_.data() + static_cast<size_t>(frame_count - 1) * frame_elems,
+                            current.data(), frame_elems * sizeof(float));
+            } else {
+                for (int i = 0; i < frame_count; ++i) {
+                    std::memcpy(packed_input_f32_.data() + static_cast<size_t>(i) * frame_elems,
+                                current.data(), frame_elems * sizeof(float));
+                }
+            }
+        }
+
+        {
+            std::wstringstream ss;
+            ss << L"vsr window frame=" << object_frame
+               << L" repeated=" << (repeated_frame ? 1 : 0)
+               << L" sequential=" << (sequential_frame ? 1 : 0)
+               << L" count=" << frame_count;
+            DebugOutHotPath(ss.str().c_str());
+        }
+
+        has_last_frame_ = true;
+        last_frame_number_ = object_frame;
+        last_object_id_ = object_id;
+        last_effect_id_ = effect_id;
+    }
+
+    void PackTemporalWindowFloat(int w, int h, int channels_per_frame, std::vector<float>& out) const {
+        const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const size_t frame_elems = plane * static_cast<size_t>(channels_per_frame);
+        const size_t expected = frame_elems * static_cast<size_t>(std::max<int64_t>(1, model_spec_.frame_count));
+        if (&out != &packed_input_f32_) {
+            out = packed_input_f32_;
+        }
+        if (out.size() != expected) {
+            out.resize(expected);
+        }
+    }
+
+    void PackTemporalWindowHalf(int w, int h, int channels_per_frame, std::vector<uint16_t>& out) const {
+        const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const size_t frame_elems = plane * static_cast<size_t>(channels_per_frame);
+        const size_t expected = frame_elems * static_cast<size_t>(std::max<int64_t>(1, model_spec_.frame_count));
+        if (&out != &packed_input_f16_) {
+            out = packed_input_f16_;
+        }
+        if (out.size() != expected) {
+            out.resize(expected);
         }
     }
 
     static bool UnpackOutputTensorFloat32(const ml::TensorFloat& tensor, int w, int h, int channels,
-                                          std::vector<PIXEL_RGBA>& out_pixels, std::wstring& error) {
+                                          std::vector<PIXEL_RGBA>& out_pixels, std::wstring& error,
+                                          const PIXEL_RGBA* src_pixels = nullptr, int src_w = 0, int src_h = 0) {
         try {
             auto ref = tensor.CreateReference();
             auto access = ref.as<IMemoryBufferByteAccess>();
@@ -1045,7 +2171,7 @@ private:
                 error = L"TensorFloat 出力バッファサイズ不足";
                 return false;
             }
-            UnpackFromFloatBuffer(reinterpret_cast<const float*>(bytes), w, h, channels, out_pixels);
+            UnpackFromFloatBuffer(reinterpret_cast<const float*>(bytes), w, h, channels, out_pixels, src_pixels, src_w, src_h);
             return true;
         } catch (const winrt::hresult_error& e) {
             error = L"TensorFloat 出力読み出し失敗: " + HResultErrorToString(e);
@@ -1054,7 +2180,8 @@ private:
     }
 
     static bool UnpackOutputTensorFloat16(const ml::TensorFloat16Bit& tensor, int w, int h, int channels,
-                                          std::vector<PIXEL_RGBA>& out_pixels, std::wstring& error) {
+                                          std::vector<PIXEL_RGBA>& out_pixels, std::wstring& error,
+                                          const PIXEL_RGBA* src_pixels = nullptr, int src_w = 0, int src_h = 0) {
         try {
             auto ref = tensor.CreateReference();
             auto access = ref.as<IMemoryBufferByteAccess>();
@@ -1069,7 +2196,7 @@ private:
                 error = L"TensorFloat16Bit 出力バッファサイズ不足";
                 return false;
             }
-            UnpackFromFloat16Buffer(reinterpret_cast<const uint16_t*>(bytes), w, h, channels, out_pixels);
+            UnpackFromFloat16Buffer(reinterpret_cast<const uint16_t*>(bytes), w, h, channels, out_pixels, src_pixels, src_w, src_h);
             return true;
         } catch (const winrt::hresult_error& e) {
             error = L"TensorFloat16Bit 出力読み出し失敗: " + HResultErrorToString(e);
@@ -1078,6 +2205,19 @@ private:
     }
 
 private:
+    void InvalidateSISRExecutionState() {
+        bound_input_shape_.clear();
+        input_tensor_f32_ = nullptr;
+        input_tensor_f16_ = nullptr;
+        bound_output_shape_.clear();
+        output_tensor_f32_ = nullptr;
+        output_tensor_f16_ = nullptr;
+        output_binding_ready_ = false;
+        cached_binding_ = nullptr;
+        binding_ready_ = false;
+        defer_output_binding_for_eval_ = false;
+    }
+
     ml::LearningModel model_{ nullptr };
     ml::LearningModelDevice device_{ nullptr };
     ml::LearningModelSession session_{ nullptr };
@@ -1086,11 +2226,32 @@ private:
     std::wstring backend_name_;
     std::wstring selected_device_name_;
     std::wstring model_path_;
+    std::vector<uint8_t> absorbed_model_bytes_;
     std::vector<int64_t> bound_input_shape_;
     ml::TensorFloat input_tensor_f32_{ nullptr };
     ml::TensorFloat16Bit input_tensor_f16_{ nullptr };
+    std::vector<int64_t> bound_output_shape_;
+    ml::TensorFloat output_tensor_f32_{ nullptr };
+    ml::TensorFloat16Bit output_tensor_f16_{ nullptr };
+    bool output_binding_ready_ = false;
+    bool defer_output_binding_for_eval_ = false;
     ml::LearningModelBinding cached_binding_{ nullptr };
     bool binding_ready_ = false;
+    std::vector<float> packed_input_f32_;
+    std::vector<uint16_t> packed_input_f16_;
+    std::vector<float> frame_scratch_f32_;
+    std::vector<uint16_t> frame_scratch_f16_;
+    std::vector<PIXEL_RGBA> last_output_pixels_;
+    int last_output_width_ = 0;
+    int last_output_height_ = 0;
+    int last_window_width_ = 0;
+    int last_window_height_ = 0;
+    int last_sisr_input_width_ = 0;
+    int last_sisr_input_height_ = 0;
+    bool has_last_frame_ = false;
+    int last_frame_number_ = std::numeric_limits<int>::min();
+    int64_t last_object_id_ = 0;
+    int64_t last_effect_id_ = 0;
 };
 static std::mutex g_mutex;
 static std::unique_ptr<WinMLEngine> g_engine;
@@ -1167,6 +2328,17 @@ static bool EnsureEngineLoaded() {
     g_last_backend_mode = backend_mode;
     g_engine = std::move(engine);
     g_last_device_name = g_engine ? g_engine->SelectedDeviceName() : L"";
+    if (g_engine) {
+        const auto& spec = g_engine->Spec();
+        std::wstringstream ss;
+        ss << L"engine loaded mode=" << ModelModeName(spec.mode)
+           << L" in_c=" << spec.in_c
+           << L" out_c=" << spec.out_c
+           << L" frames=" << spec.frame_count
+           << L" cpf=" << spec.channels_per_frame;
+        if (!g_last_device_name.empty()) ss << L" device=" << g_last_device_name;
+        DebugOut(ss.str().c_str());
+    }
     return true;
 }
 
@@ -1177,6 +2349,15 @@ static bool func_proc_video_impl(FILTER_PROC_VIDEO* video) {
     const int width = video->object->width;
     const int height = video->object->height;
     if (width <= 0 || height <= 0) return true;
+
+    {
+        std::wstringstream ss;
+        ss << L"proc frame=" << video->object->frame
+           << L" obj=" << video->object->id
+           << L" eff=" << video->object->effect_id
+           << L" size=" << width << L"x" << height;
+        DebugOutHotPath(ss.str().c_str());
+    }
 
     std::wstring size_error;
     if (!ValidateFrameSize(width, height, size_error)) {
@@ -1207,7 +2388,7 @@ static bool func_proc_video_impl(FILTER_PROC_VIDEO* video) {
             DebugOut(g_last_error.c_str());
             return true;
         }
-        if (!g_engine->RunPixels(src_pixels.data(), width, height, dst_pixels, out_w, out_h, err)) {
+        if (!g_engine->RunPixels(src_pixels.data(), width, height, video->object->frame, video->object->id, video->object->effect_id, dst_pixels, out_w, out_h, err)) {
             g_last_error = err.empty() ? L"推論に失敗しました" : err;
             DebugOut(g_last_error.c_str());
             return true;
@@ -1257,17 +2438,16 @@ static bool func_proc_video(FILTER_PROC_VIDEO* video) {
     }
 }
 
-#define PLUGIN_NAME      L"AI S-R ONNX"
-#define PLUGIN_VERSION   L"1.0"
-#define PLUGIN_TITLE     PLUGIN_NAME L" " PLUGIN_VERSION
-#define PLUGIN_MENU_NAME PLUGIN_NAME
-#define PLUGIN_INFO_NAME PLUGIN_TITLE
+#define PLUGIN_NAME         L"AI S-R ONNX"
+#define PLUGIN_VERSION      L"1.1"
+#define PLUGIN_CATEGORY     L"加工"
+#define PLUGIN_INFORMATION  PLUGIN_NAME L" " PLUGIN_VERSION
 
 static FILTER_PLUGIN_TABLE g_filter_plugin_table = {
     FILTER_PLUGIN_TABLE::FLAG_VIDEO,
-    PLUGIN_MENU_NAME,
-    PLUGIN_INFO_NAME,
-    PLUGIN_INFO_NAME,
+    PLUGIN_NAME,
+    PLUGIN_CATEGORY,
+    PLUGIN_INFORMATION,
     g_items,
     func_proc_video,
     nullptr
